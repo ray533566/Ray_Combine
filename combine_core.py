@@ -8,6 +8,7 @@ Core logic (no UI) for combining 'Mapping' sheets of *-Chart-80-400mA.xlsx files
   is recalculated from the RawData sheet.
 - Can append new rows below an existing (previously combined) Excel file.
 """
+import re
 from io import BytesIO
 
 import openpyxl
@@ -36,44 +37,92 @@ def _trim(rows):
 
 
 # ------------------------------------------------- fallback recalculation
-def _recalc_mapping(wb_f, sheet, c1, c2):
-    """Recompute the standard Mapping template from RawData (no Excel cache)."""
-    raw = wb_f["RawData"]
-    iE, iF, iP, iT, iAF = (column_index_from_string(x) - 1 for x in ("E", "F", "P", "T", "AF"))
-    rows = list(raw.iter_rows(min_row=2, values_only=True))
-    tn = rows[0][1] if rows else None
-    lut_wl, lut_sm = {}, {}
-    for r in rows:
-        if r[iE] is None:
-            continue
-        k = (r[iE], r[iF], r[iAF])
-        lut_wl[k] = lut_wl.get(k, 0) + (r[iP] or 0)
-        lut_sm[k] = lut_sm.get(k, 0) + (r[iT] or 0)
+_RE_RAWREF = re.compile(r"^=RawData!\$?([A-Z]+)\$?(\d+)$")                       # =RawData!A2
+_RE_IFRAW = re.compile(r'^=IF\(RawData!\$?([A-Z]+)\$?(\d+)="","",RawData!\$?\1\$?\2\)$')  # =IF(RawData!$B$2="","",..)
+_RE_SUMIFS = re.compile(r"SUMIFS\(RawData!\$?([A-Z]+):\$?[A-Z]+,(.*)\)\)$")       # target column + criteria
+_RE_CRIT = re.compile(r'RawData!\$?([A-Z]+):\$?[A-Z]+,("([^"]*)"&)?\$?([A-Z]+)\$?\d+')
+_RE_DIFF = re.compile(r"^=([A-Z]+)(\d+)-([A-Z]+)(\d+)$")                          # =G3-G2
+_RE_ARITH = re.compile(r"^[0-9+\-*/(). ,]*$")
 
-    out, prev_g = [], None
+
+def _eval_row_formula(f, n):
+    """Evaluate ROW()-based arithmetic: =MOD(INT((ROW()-2)/31),4)+1, =100+10*MOD(ROW()-2,31) ..."""
+    expr = f[1:].replace("ROW()", str(n)).replace("MOD(", "_mod(").replace("INT(", "_int(")
+    if not _RE_ARITH.match(expr.replace("_mod", "").replace("_int", "")):
+        return None
+    return eval(expr, {"__builtins__": {}}, {"_mod": lambda a, b: a % b, "_int": lambda x: int(x // 1)})
+
+
+def _recalc_mapping(wb_f, sheet, c1, c2):
+    """Recompute Mapping values from RawData by interpreting the Mapping formulas
+    (works for any current range / step / extra SUMIFS columns, e.g. 80-400mA or 100-400mA)."""
+    raw = wb_f["RawData"]
+    raw_rows = list(raw.iter_rows(values_only=True))           # raw_rows[0] = Excel row 1
+    def rv(col, r):
+        i, j = r - 1, column_index_from_string(col) - 1
+        return raw_rows[i][j] if i < len(raw_rows) and j < len(raw_rows[i]) else None
+
+    sum_cache = {}                                             # (target, critcols) -> {key: sum}
+    def lookup(target, crit_cols, key):
+        ck = (target, crit_cols)
+        if ck not in sum_cache:
+            ti = column_index_from_string(target) - 1
+            ci = [column_index_from_string(c) - 1 for c in crit_cols]
+            d = {}
+            for r in raw_rows[1:]:
+                k = tuple(r[i] for i in ci)
+                v = r[ti]
+                d[k] = d.get(k, 0) + (v if isinstance(v, (int, float)) else 0)
+                d.setdefault(("__n__",) + k, True)
+            sum_cache[ck] = d
+        d = sum_cache[ck]
+        return d.get(key, "") if ("__n__",) + key in d else ""
+
+    out, done = [], {}                                         # done[(col_letter, row)] = value
     for i, frow in enumerate(wb_f[sheet].iter_rows(min_row=2, min_col=c1, max_col=c2, values_only=True)):
         if row_empty(frow):
             break
         n = i + 2
-        ch = (n - 2) // 33 % 4 + 1
-        temp = -5 + 5 * ((n - 2) // 132)
-        cur = 80 + 10 * ((n - 2) % 33)
-        k = (temp, f"CH{ch}", cur)
-        g, h = lut_wl.get(k, ""), lut_sm.get(k, "")
-        sn = rows[n - 2][0] if n - 2 < len(rows) else None
-        dwl = None if n == 2 else ((g if g != "" else 0) - (prev_g if prev_g not in ("", None) else 0))
-        calc = {1: frow[0], 2: sn, 3: tn, 4: ch, 5: temp, 6: cur, 7: g, 8: h, 9: dwl}
         row = []
-        for j, v in enumerate(frow):
-            col = c1 + j
-            if col in calc and is_formula(v):
-                row.append(calc[col])
-            elif col == 9 and n == 2:
-                row.append(None)
-            else:
-                row.append(None if is_formula(v) else v)
+        for j, f in enumerate(frow):
+            col = get_column_letter(c1 + j)
+            val = f
+            if is_formula(f):
+                f = f.replace(" ", "")
+                val = None
+                if m := _RE_RAWREF.match(f):
+                    val = rv(m[1], int(m[2]))
+                elif m := _RE_IFRAW.match(f):
+                    v = rv(m[1], int(m[2]))
+                    val = "" if v in (None, "") else v
+                elif m := _RE_SUMIFS.search(f):
+                    crits = _RE_CRIT.findall(m[2])
+                    crit_cols = tuple(c[0] for c in crits)
+                    key = tuple((c[2] + str(done.get((c[3], n), ""))) if c[1] else done.get((c[3], n))
+                                for c in crits)
+                    val = lookup(m[1], crit_cols, key)
+                elif m := _RE_DIFF.match(f):
+                    a, b = done.get((m[1], int(m[2]))), done.get((m[3], int(m[4])))
+                    a = 0 if a in ("", None) else a
+                    b = 0 if b in ("", None) else b
+                    val = a - b
+                elif "ROW()" in f:
+                    val = _eval_row_formula(f, n)
+            done[(col, n)] = val
+            row.append(val)
         out.append(row)
-        prev_g = g
+    return out
+
+
+_RE_HDR = re.compile(r'^=RawData!\$?A\$?2&"-?([^"]*)"$')   # =RawData!A2&"-Case_Temp"
+
+
+def _clean_header(header, formula_header):
+    """'48226H40040-Case_Temp' (SN of the first file) -> 'Case_Temp'."""
+    out = list(header)
+    for j, f in enumerate(formula_header[:len(out)]):
+        if is_formula(f) and (m := _RE_HDR.match(f.replace(" ", ""))):
+            out[j] = m[1]
     return out
 
 
@@ -92,17 +141,22 @@ def read_mapping(data: bytes, sheet="Mapping", cols="A:AZ"):
     header, body = rows[0], rows[1:]
 
     note = ""
-    wb_f = openpyxl.load_workbook(BytesIO(data))
-    ws = wb_f[sheet]
-    probe = [c.value for c in ws[2]][c1 - 1:c2] if ws.max_row >= 2 else []
+    # formulas of row 1-2 only (fast, read-only)
+    wb_p = openpyxl.load_workbook(BytesIO(data), read_only=True)
+    top = [list(r) for r in wb_p[sheet].iter_rows(min_row=1, max_row=2, min_col=c1, max_col=c2, values_only=True)]
+    has_raw = "RawData" in wb_p.sheetnames
+    wb_p.close()
+    header = _clean_header(header, top[0] if top else [])
+    probe = top[1] if len(top) > 1 else []
     no_cache = body and any(is_formula(f) for f in probe) and all(
         body[0][j] is None for j, f in enumerate(probe) if is_formula(f))
     if no_cache:
-        if "RawData" not in wb_f.sheetnames:
+        if not has_raw:
             raise ValueError("no cached formula values and no RawData sheet")
+        wb_f = openpyxl.load_workbook(BytesIO(data))     # full load only when needed
         body = _recalc_mapping(wb_f, sheet, c1, c2)
+        wb_f.close()
         note = "recalculated from RawData (no Excel cache)"
-    wb_f.close()
     return header, body, note
 
 
