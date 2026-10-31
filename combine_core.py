@@ -153,7 +153,8 @@ def read_sheet(data: bytes, sheet="Mapping", cols="A:AZ"):
     wb_v.close()
     if not rows:
         raise ValueError("empty sheet")
-    header, body = rows[0], rows[1:]
+    w = used_width(rows[0], rows[1:])                  # drop empty columns on the right
+    header, body = rows[0][:w], [r[:w] for r in rows[1:]]
 
     note = ""
     # formulas of row 1-2 only (fast, read-only)
@@ -188,7 +189,8 @@ def read_table(data: bytes, cols="A:AZ", sheet=None):
     wb.close()
     if not rows:
         raise ValueError("empty sheet")
-    return rows[0], rows[1:], name
+    w = used_width(rows[0], rows[1:])
+    return rows[0][:w], [r[:w] for r in rows[1:]], name
 
 
 def read_any(data: bytes, sheet="Mapping", cols="A:AZ"):
@@ -217,20 +219,6 @@ def keys_of(rows, kc):
         return set()
     a, b = kc
     return {(str(r[a]), str(r[b])) for r in rows if len(r) > max(a, b) and r[a] is not None}
-
-
-def _hkeys(header):
-    """Match keys per column: text headers by (name, occurrence) so repeated names
-    ('Spec', 'Spec') stay separate; number/date/blank header cells by position."""
-    keys, n = [], {}
-    for j, h in enumerate(header):
-        if isinstance(h, str) and h.strip():
-            k = h.strip().lower()
-            n[k] = n.get(k, 0) + 1
-            keys.append(("name", k, n[k]))
-        else:
-            keys.append(("pos", j))
-    return keys
 
 
 def same_header(a, b):

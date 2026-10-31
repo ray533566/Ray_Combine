@@ -94,6 +94,10 @@ st.caption("Combine any sheet (pick by name) of many Excel files into one · Row
 
 # ---------------------------------------------------------------- settings
 with st.sidebar:
+    st.header("Sheet name")
+    sheet_slot = st.empty()          # filled with the sheet list after files are uploaded
+    sheet_slot.info("Upload Excel files (or a .zip) to choose the sheet(s) to combine.")
+    st.divider()
     st.header("Settings")
     cols = st.text_input("Column range", "A:AZ", help="e.g. A:AZ. Leave empty (or ALL) for all used columns.")
     mismatch = st.radio(
@@ -171,13 +175,16 @@ count = Counter(s for v in sheets_of.values() for s in v)
 order = sorted(count, key=lambda s: (-count[s], [n for v in sheets_of.values() for n in v].index(s)))
 n_files = len(new_files)
 default = ["Mapping"] if "Mapping" in count else order[:1]
-picked = st.multiselect(
-    f"Sheet(s) to combine — {n_files} file(s) uploaded", order, default=default,
-    format_func=lambda s: f"{s}   ({count[s]}/{n_files} files)",
-    help="Each selected sheet becomes one sheet in the output file.")
+with sheet_slot.container():
+    picked = st.multiselect(
+        f"Sheet(s) to combine — found in {n_files} file(s)", order, default=default,
+        format_func=lambda s: f"{s}   ({count[s]}/{n_files} files)",
+        help="Click to open the list, or type to search. Each selected sheet becomes one sheet "
+             "in the output file. (x/y files) = how many uploaded files contain that sheet.")
 if not picked:
-    st.info("Select at least one sheet.")
+    st.info("👈 Choose at least one sheet under **Sheet name** in the sidebar.")
     st.stop()
+st.markdown("**Sheets to combine:** " + " · ".join(f"`{s}`" for s in picked))
 
 old_sheets = cc.list_sheets(old_file.getvalue()) if old_file else []
 
@@ -192,7 +199,7 @@ def old_match(sheet):
 
 
 # signature of current inputs — hides an old result when inputs change
-sig = (f1, f2, tuple(picked), cols, mismatch, skip_dup, dedup_rows, add_src,
+sig = (f1, f2, tuple(picked), cols, key_col, mismatch, skip_dup, dedup_rows, add_src,
        (old_file.name, old_file.size) if old_file else None,
        tuple((f.name, f.size) for f in new_files))
 
